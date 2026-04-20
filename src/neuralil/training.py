@@ -29,11 +29,15 @@ try:
     from learned_optimization.optimizers.opt_to_optax import (
         GradientTransformationWithExtraArgs,
     )
+    from learned_optimization.research.general_lopt import prefab
 except ImportError:
-    from optax import (
-        GradientTransformationExtraArgs as GradientTransformationWithExtraArgs,
-    )
-from learned_optimization.research.general_lopt import prefab
+    try:
+        from optax import (
+            GradientTransformationExtraArgs as GradientTransformationWithExtraArgs,
+        )
+    except ImportError:
+        GradientTransformationWithExtraArgs = None
+    prefab = None
 
 # This module contains code specific to the training step.
 
