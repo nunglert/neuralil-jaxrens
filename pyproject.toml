@@ -31,7 +31,6 @@ dependencies = [
     "flax",
     "jax",
     "jaxlib",
-    "learned-optimization",
     "matplotlib",
     "numpy",
     "optax",
@@ -40,6 +39,11 @@ dependencies = [
 ]
 readme = "README.md"
 dynamic = ["version"]
+
+[project.optional-dependencies]
+velo = [
+    "learned-optimization @ git+https://github.com/google/learned_optimization.git"
+]         
 
 [tool.setuptools.packages.find]
 where = ["src"]
