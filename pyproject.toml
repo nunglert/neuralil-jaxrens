@@ -33,7 +33,7 @@ dependencies = [
     "jaxlib",
     "learned-optimization",
     "matplotlib",
-    "numpy<2.0",
+    "numpy",
     "optax",
     "scipy",
     "tqdm"
