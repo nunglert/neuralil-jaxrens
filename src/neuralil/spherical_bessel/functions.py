@@ -189,7 +189,7 @@ def create_j_l(order: int, dtype: onp.dtype = onp.float32):
         r = jnp.asarray(r)
         condition = r < order
         return (
-            condition * j_l_Cai(jnp.clip(r, a_max=order))[0]
+            condition * j_l_Cai(jnp.clip(r, max=order))[0]
             + (1.0 - condition) * j_l_upward(r)[0]
         )
 
@@ -199,7 +199,7 @@ def create_j_l(order: int, dtype: onp.dtype = onp.float32):
     def j_l_jvp(primals, tangents):
         (r,) = primals
         (r_dot,) = tangents
-        Cai, Cai_dot = j_l_Cai(jnp.clip(r, a_max=order))
+        Cai, Cai_dot = j_l_Cai(jnp.clip(r, max=order))
         upward, upward_dot = j_l_upward(r)
         condition = r < order
         primal_out = condition * Cai + (1.0 - condition) * upward
