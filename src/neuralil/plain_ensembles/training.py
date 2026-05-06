@@ -74,7 +74,9 @@ def get_n_models(model_params):
     return model_params["params"]["neuralil"]["denormalizer"]["bias"].shape[0]
 
 
-def create_training_step(model, optimizer, calc_loss_contribution):
+def create_training_step(
+    model, optimizer, calc_loss_contribution, max_neighbors
+):
     @jax.jit
     def training_step(
         optimizer_state,
@@ -95,6 +97,7 @@ def create_training_step(model, optimizer, calc_loss_contribution):
                     positions,
                     types,
                     cell,
+                    max_neighbors,
                     method=model.calc_potential_energy_and_forces,
                 )
                 pred_forces = jnp.where(
@@ -201,13 +204,16 @@ def create_training_epoch(
     return training_epoch
 
 
-def _create_individual_validation_calculator(model, validation_statistics):
+def _create_individual_validation_calculator(
+    model, validation_statistics, max_neighbors
+):
     def nruter(model_params, positions, types, cell, energy, forces):
         pred_energy, pred_forces = model.apply(
             model_params,
             positions,
             types,
             cell,
+            max_neighbors,
             method=model.calc_potential_energy_and_forces,
         )
         pred_forces = jnp.where(
@@ -270,6 +276,7 @@ def create_validation_step(
     energies,
     forces,
     n_batch,
+    max_neighbors,
     progress_bar=True,
 ):
     n_samples = positions.shape[0]
@@ -278,7 +285,7 @@ def create_validation_step(
         remainder = n_batch
 
     individual_calculator = _create_individual_validation_calculator(
-        model, validation_statistics
+        model, validation_statistics, max_neighbors
     )
     batch_calculator = _create_batch_validation_calculator(
         individual_calculator, validation_statistics

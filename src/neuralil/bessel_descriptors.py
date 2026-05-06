@@ -395,13 +395,14 @@ def get_max_number_of_neighbors(
 class PowerSpectrumGenerator:
     """
     Creates a functor that returns all the descriptors of an atom. It must be
-    initialized with the maximum n and the number of atom types, as well as the
-    maximum allowed number of neighbors. If a calculation involves denser
-    environments, the error will be silently ignored. Use
-    get_max_number_of_neighbors to check this condition if needed. A supercell
-    matrix can be provided if the cutoff sphere around any of the atoms is
-    expected to be too large to fit in the cell.
-    Atoms with the type -1 (Administratium) are ignored.
+    initialized with the maximum n and the number of atom types. The
+    maximum allowed number of neighbors is supplied at *call* time so that
+    a single generator can serve multiple buffer sizes without rebuilding.
+    If a calculation involves denser environments, the error will be
+    silently ignored. Use get_max_number_of_neighbors to check this
+    condition if needed. A supercell matrix can be provided if the cutoff
+    sphere around any of the atoms is expected to be too large to fit in
+    the cell. Atoms with the type -1 (Administratium) are ignored.
     """
 
     def __init__(
@@ -409,13 +410,11 @@ class PowerSpectrumGenerator:
         max_order: int,
         cutoff: float,
         n_types: int,
-        max_neighbors: int,
         supercell_diag: Sequence[int] = (1, 1, 1),
     ):
         self._n_max = max_order
         self._r_c = cutoff
         self._n_types = n_types
-        self._max_neighbors = max_neighbors
         self._radial = RadialBasis(self._n_max, cutoff)
         self._too_many_neighbors = False
         self._angular = build_Legendre_polynomials(self._n_max)
@@ -453,16 +452,20 @@ class PowerSpectrumGenerator:
         coordinates: jnp.ndarray,
         a_types: jnp.ndarray,
         cell_size: jnp.ndarray,
+        max_neighbors: int,
     ) -> jnp.ndarray:
         if not isinstance(coordinates, jnp.ndarray):
             coordinates = jnp.array(coordinates.numpy())
-        return self.process_data(coordinates, a_types, cell_size=cell_size)
+        return self.process_data(
+            coordinates, a_types, cell_size, max_neighbors
+        )
 
     def process_data(
         self,
         coordinates: jnp.ndarray,
         a_types: jnp.ndarray,
         cell_size: jnp.ndarray,
+        max_neighbors: int,
     ) -> jnp.ndarray:
         deltas, radii, a_types = self.center_at_atoms(
             coordinates, a_types, cell_size
@@ -471,7 +474,7 @@ class PowerSpectrumGenerator:
         nruter = jax.lax.map(
             jax.checkpoint(
                 lambda args: self._process_center(
-                    args[0], args[1], a_types, weights
+                    args[0], args[1], a_types, weights, max_neighbors
                 )
             ),
             (deltas, radii),
@@ -484,6 +487,7 @@ class PowerSpectrumGenerator:
         all_types: jnp.ndarray,
         some_coordinates: jnp.array,
         cell_size: jnp.ndarray,
+        max_neighbors: int,
     ) -> jnp.ndarray:
         deltas, radii, all_types = self.center_at_points(
             all_coordinates, some_coordinates, all_types, cell_size
@@ -492,7 +496,7 @@ class PowerSpectrumGenerator:
         nruter = jax.lax.map(
             jax.checkpoint(
                 lambda args: self._process_center(
-                    args[0], args[1], all_types, weights
+                    args[0], args[1], all_types, weights, max_neighbors
                 )
             ),
             (deltas, radii),
@@ -505,9 +509,10 @@ class PowerSpectrumGenerator:
         a_types: jnp.ndarray,
         index: int,
         cell_size: jnp.ndarray,
+        max_neighbors: int,
     ) -> jnp.ndarray:
         return self.process_center(
-            coordinates, a_types, coordinates[index], cell_size
+            coordinates, a_types, coordinates[index], cell_size, max_neighbors
         )
 
     def process_center(
@@ -516,12 +521,15 @@ class PowerSpectrumGenerator:
         a_types: jnp.ndarray,
         center: jnp.ndarray,
         cell_size: jnp.ndarray,
+        max_neighbors: int,
     ) -> jnp.ndarray:
         deltas, radii, a_types = self.center_at_point(
             coordinates, center, a_types, cell_size=cell_size
         )
         weights = jax.nn.one_hot(a_types, self._n_types)
-        return self._process_center(deltas, radii, a_types, weights)
+        return self._process_center(
+            deltas, radii, a_types, weights, max_neighbors
+        )
 
     def _process_center(
         self,
@@ -529,14 +537,13 @@ class PowerSpectrumGenerator:
         radii: jnp.ndarray,
         a_types: jnp.ndarray,
         weights: jnp.ndarray,
+        max_neighbors: int,
     ) -> jnp.ndarray:
         inner_shape = self._inner_shape
         outer_shape = self._outer_shape
         prefactors = (2.0 * jnp.arange(self._n_max + 1.0) + 1.0) / 4.0 / jnp.pi
 
-        neighbors = jnp.lexsort((radii, a_types < 0))[
-            1 : self._max_neighbors + 1
-        ]
+        neighbors = jnp.lexsort((radii, a_types < 0))[1 : max_neighbors + 1]
         deltas = jnp.take(deltas, neighbors, axis=0)
         radii = jnp.take(radii, neighbors, axis=0)
         weights = jnp.take(weights, neighbors, axis=0)
@@ -623,13 +630,6 @@ class PowerSpectrumGenerator:
         """
         return self._n_types
 
-    @property
-    def max_neighbors(self) -> int:
-        """
-        The maximum number of neighbors allowed
-        """
-        return self._n_types
-
 
 if __name__ == "__main__":
     import time
@@ -670,9 +670,8 @@ if __name__ == "__main__":
         ]
     )
 
-    generator = PowerSpectrumGenerator(
-        N_MAX, R_CUT, ATOM_TYPES, coords.shape[0] - 1
-    )
+    generator = PowerSpectrumGenerator(N_MAX, R_CUT, ATOM_TYPES)
+    MAX_NEIGHBORS = coords.shape[0] - 1
 
     DELTA = 1e-3
     coords_plus = jnp.array(
@@ -696,9 +695,9 @@ if __name__ == "__main__":
 
     atom_types = jnp.array([0] * coords.shape[0])
     processor = jax.jit(
-        lambda x: generator.process_atom(x, atom_types, 0, jnp.zeros((3, 3)))[
-            0, :
-        ]
+        lambda x: generator.process_atom(
+            x, atom_types, 0, jnp.zeros((3, 3)), MAX_NEIGHBORS
+        )[0, :]
     )
     descriptors = processor(coords)
 
@@ -727,11 +726,13 @@ if __name__ == "__main__":
     print("Norm of the difference:", la.norm(REFERENCE - descriptors))
 
     full_processor = jax.jit(
-        lambda x: generator.process_data(x, atom_types, jnp.zeros((3, 3)))
+        lambda x: generator.process_data(
+            x, atom_types, jnp.zeros((3, 3)), MAX_NEIGHBORS
+        )
     )
     part_processor = jax.jit(
         lambda x, i: generator.process_atom(
-            x, atom_types, i, jnp.zeros((3, 3))
+            x, atom_types, i, jnp.zeros((3, 3)), MAX_NEIGHBORS
         )
     )
     full = full_processor(coords)

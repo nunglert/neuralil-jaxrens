@@ -48,9 +48,9 @@ class PlainEnsemble(flax.linen.Module):
         # ensemble axis.
         self._calc_jacobian = jax.jacrev(self.calc_potential_energy, argnums=0)
 
-    def calc_atomic_energies(self, positions, types, cell):
+    def calc_atomic_energies(self, positions, types, cell, max_neighbors):
         descriptors = self.neuralil.descriptor_generator(
-            positions, types, cell
+            positions, types, cell, max_neighbors
         )
         # Note the expansion of "types" to account for the ensemble axis.
         return (types >= 0)[
@@ -60,10 +60,16 @@ class PlainEnsemble(flax.linen.Module):
         )
 
     def calc_some_atomic_energies(
-        self, some_positions, some_types, all_positions, all_types, cell
+        self,
+        some_positions,
+        some_types,
+        all_positions,
+        all_types,
+        cell,
+        max_neighbors,
     ):
         some_descriptors = self.neuralil.partial_descriptor_generator(
-            all_positions, all_types, some_positions, cell
+            all_positions, all_types, some_positions, cell, max_neighbors
         )
         return (some_types >= 0)[
             jnp.newaxis, :
@@ -71,21 +77,25 @@ class PlainEnsemble(flax.linen.Module):
             self.neuralil, some_descriptors, some_types
         )
 
-    def calc_potential_energy(self, positions, types, cell):
-        contributions = self.calc_atomic_energies(positions, types, cell)
+    def calc_potential_energy(self, positions, types, cell, max_neighbors):
+        contributions = self.calc_atomic_energies(
+            positions, types, cell, max_neighbors
+        )
         # Note the change of axis to account for the prepending of the
         # ensemble axis.
         return jnp.squeeze(contributions.sum(axis=1))
 
-    def calc_forces(self, positions, types, cell):
+    def calc_forces(self, positions, types, cell, max_neighbors):
         # Note the switch from gradient to Jacobian to account for the
         # ensemble axis.
-        return -self._calc_jacobian(positions, types, cell)
+        return -self._calc_jacobian(positions, types, cell, max_neighbors)
 
-    def calc_potential_energy_and_forces(self, positions, types, cell):
+    def calc_potential_energy_and_forces(
+        self, positions, types, cell, max_neighbors
+    ):
         return (
-            self.calc_potential_energy(positions, types, cell),
-            self.calc_forces(positions, types, cell),
+            self.calc_potential_energy(positions, types, cell, max_neighbors),
+            self.calc_forces(positions, types, cell, max_neighbors),
         )
 
 
@@ -129,9 +139,9 @@ class PlainEnsemblewithMorse(flax.linen.Module):
         )
         self._calc_jacobian = jax.jacrev(self.calc_potential_energy, argnums=0)
 
-    def calc_atomic_energies(self, positions, types, cell):
+    def calc_atomic_energies(self, positions, types, cell, max_neighbors):
         descriptors = self.neuralil.descriptor_generator(
-            positions, types, cell
+            positions, types, cell, max_neighbors
         )
         nn_contributions = self.calc_atomic_energies_from_descriptors(
             self.neuralil, descriptors, types
@@ -145,10 +155,16 @@ class PlainEnsemblewithMorse(flax.linen.Module):
         )
 
     def calc_some_atomic_energies(
-        self, some_positions, some_types, all_positions, all_types, cell
+        self,
+        some_positions,
+        some_types,
+        all_positions,
+        all_types,
+        cell,
+        max_neighbors,
     ):
         some_descriptors = self.neuralil.partial_descriptor_generator(
-            all_positions, all_types, some_positions, cell
+            all_positions, all_types, some_positions, cell, max_neighbors
         )
         nn_contributions = self.calc_atomic_energies_from_descriptors(
             self.neuralil, some_descriptors, some_types
@@ -165,19 +181,23 @@ class PlainEnsemblewithMorse(flax.linen.Module):
             nn_contributions + morse_contributions
         )
 
-    def calc_potential_energy(self, positions, types, cell):
-        contributions = self.calc_atomic_energies(positions, types, cell)
+    def calc_potential_energy(self, positions, types, cell, max_neighbors):
+        contributions = self.calc_atomic_energies(
+            positions, types, cell, max_neighbors
+        )
         # Note the change of axis to account for the prepending of the
         # ensemble axis.
         return jnp.squeeze(contributions.sum(axis=1))
 
-    def calc_forces(self, positions, types, cell):
+    def calc_forces(self, positions, types, cell, max_neighbors):
         # Note the switch from gradient to Jacobian to account for the
         # ensemble axis.
-        return -self._calc_jacobian(positions, types, cell)
+        return -self._calc_jacobian(positions, types, cell, max_neighbors)
 
-    def calc_potential_energy_and_forces(self, positions, types, cell):
+    def calc_potential_energy_and_forces(
+        self, positions, types, cell, max_neighbors
+    ):
         return (
-            self.calc_potential_energy(positions, types, cell),
-            self.calc_forces(positions, types, cell),
+            self.calc_potential_energy(positions, types, cell, max_neighbors),
+            self.calc_forces(positions, types, cell, max_neighbors),
         )

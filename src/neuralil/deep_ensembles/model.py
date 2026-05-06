@@ -187,13 +187,17 @@ class HeteroscedasticNeuralIL(flax.linen.Module):
             + (types < 0),
         )
 
-    def calc_atomic_energies(self, positions, types, cell):
-        descriptors = self.descriptor_generator(positions, types, cell)
+    def calc_atomic_energies(self, positions, types, cell, max_neighbors):
+        descriptors = self.descriptor_generator(
+            positions, types, cell, max_neighbors
+        )
         heads = self.calc_heads_from_descriptors(descriptors, types)
         return heads
 
-    def calc_potential_energy(self, positions, types, cell):
-        contributions = self.calc_atomic_energies(positions, types, cell)
+    def calc_potential_energy(self, positions, types, cell, max_neighbors):
+        contributions = self.calc_atomic_energies(
+            positions, types, cell, max_neighbors
+        )
         return (
             jnp.squeeze(contributions[0].sum(axis=0)),
             (
@@ -202,10 +206,12 @@ class HeteroscedasticNeuralIL(flax.linen.Module):
             ),
         )
 
-    def calc_all_results(self, positions, types, cell):
-        grad_and_aux = self._calc_grad(positions, types, cell)
+    def calc_all_results(self, positions, types, cell, max_neighbors):
+        grad_and_aux = self._calc_grad(positions, types, cell, max_neighbors)
         return (
-            self.calc_potential_energy(positions, types, cell)[0],
+            self.calc_potential_energy(positions, types, cell, max_neighbors)[
+                0
+            ],
             -grad_and_aux[0],
             grad_and_aux[1][0],
             grad_and_aux[1][1],
@@ -233,17 +239,19 @@ class DeepEnsemble(flax.linen.Module):
             self.calc_potential_energy, argnums=0, has_aux=True
         )
 
-    def calc_atomic_energies(self, positions, types, cell):
+    def calc_atomic_energies(self, positions, types, cell, max_neighbors):
         descriptors = self.h_neuralil.descriptor_generator(
-            positions, types, cell
+            positions, types, cell, max_neighbors
         )
         heads = self.calc_heads_from_descriptors(
             self.h_neuralil, descriptors, types
         )
         return heads
 
-    def calc_potential_energy(self, positions, types, cell):
-        contributions = self.calc_atomic_energies(positions, types, cell)
+    def calc_potential_energy(self, positions, types, cell, max_neighbors):
+        contributions = self.calc_atomic_energies(
+            positions, types, cell, max_neighbors
+        )
         # Note the change of axis to account for the prepending of the
         # ensemble axis.
         return (
@@ -254,10 +262,14 @@ class DeepEnsemble(flax.linen.Module):
             ),
         )
 
-    def calc_all_results(self, positions, types, cell):
-        jacobian_and_aux = self._calc_jacobian(positions, types, cell)
+    def calc_all_results(self, positions, types, cell, max_neighbors):
+        jacobian_and_aux = self._calc_jacobian(
+            positions, types, cell, max_neighbors
+        )
         return (
-            self.calc_potential_energy(positions, types, cell)[0],
+            self.calc_potential_energy(positions, types, cell, max_neighbors)[
+                0
+            ],
             -jacobian_and_aux[0],
             jacobian_and_aux[1][0],
             jacobian_and_aux[1][1],

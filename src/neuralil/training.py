@@ -279,7 +279,9 @@ class BatchedIterator:
         raise StopIteration
 
 
-def create_training_step(model, optimizer, calc_loss_contribution):
+def create_training_step(
+    model, optimizer, calc_loss_contribution, max_neighbors
+):
     """Create a function that takes care of a single training step.
 
     Args:
@@ -343,6 +345,7 @@ def create_training_step(model, optimizer, calc_loss_contribution):
                     positions,
                     types,
                     cell,
+                    max_neighbors,
                     method=model.calc_potential_energy_and_forces,
                 )
                 pred_forces = jnp.where(
@@ -579,13 +582,16 @@ def create_flogcosh_validation_statistic(logcosh_parameter):
     )
 
 
-def _create_individual_validation_calculator(model, validation_statistics):
+def _create_individual_validation_calculator(
+    model, validation_statistics, max_neighbors
+):
     """Create a function to evaluate validation statistics for a single point.
 
     Args:
         model: The Flax model object to be evaluated.
         validation_statistics: A dictionary of ValidationStatistics named
             tuples.
+        max_neighbors: Buffer size for the descriptor's neighbor list.
 
     Returns:
         A function that takes six parameters: (model_params, positions, types,
@@ -619,6 +625,7 @@ def _create_individual_validation_calculator(model, validation_statistics):
             positions,
             types,
             cell,
+            max_neighbors,
             method=model.calc_potential_energy_and_forces,
         )
         pred_forces = jnp.where(
@@ -715,6 +722,7 @@ def create_validation_step(
     energies,
     forces,
     n_batch,
+    max_neighbors,
     progress_bar=True,
 ):
     """Create a driver for a validation step.
@@ -735,6 +743,7 @@ def create_validation_step(
             used for validation.
         n_batch: The size of the minibatches over which the calculation of the
             validation statistics will be vectorized.
+        max_neighbors: Buffer size for the descriptor's neighbor list.
         progress_bar: A boolean toggle determining whether a progress bar will
             be shown on screen.
 
@@ -748,7 +757,7 @@ def create_validation_step(
         remainder = n_batch
 
     individual_calculator = _create_individual_validation_calculator(
-        model, validation_statistics
+        model, validation_statistics, max_neighbors
     )
     batch_calculator = _create_batch_validation_calculator(
         individual_calculator, validation_statistics

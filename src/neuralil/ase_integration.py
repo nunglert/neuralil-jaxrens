@@ -71,7 +71,6 @@ class NeuralILASECalculator(Calculator):
             model_info.n_max,
             model_info.r_cut,
             len(model_info.sorted_elements),
-            max_neighbors,
         )
         self.model = model
         self.model_info = copy.deepcopy(model_info)
@@ -92,6 +91,7 @@ class NeuralILASECalculator(Calculator):
             jnp.zeros((type(self)._ADAMS_NUMBER, 3)),
             jnp.zeros(type(self)._ADAMS_NUMBER, dtype=jnp.asarray(1).dtype),
             jnp.eye(3),
+            self.max_neighbors,
             method=self.model.calc_forces,
         )
         # NOTE: I do not fully understand why this cast is necesary, or rather
@@ -121,6 +121,7 @@ class NeuralILASECalculator(Calculator):
             positions,
             types,
             cell,
+            self.max_neighbors,
             method=self.model.calc_some_atomic_energies,
         )
 

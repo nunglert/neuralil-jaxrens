@@ -509,8 +509,10 @@ class NeuralIL(flax.linen.Module):
             self.calc_potential_energy, argnums=0
         )
 
-    def calc_combined_inputs(self, positions, types, cell):
-        descriptors = self.descriptor_generator(positions, types, cell)
+    def calc_combined_inputs(self, positions, types, cell, max_neighbors):
+        descriptors = self.descriptor_generator(
+            positions, types, cell, max_neighbors
+        )
         embeddings = self.embed(types)
         combined_inputs = self.mixer(descriptors, embeddings)
         return combined_inputs
@@ -552,7 +554,7 @@ class NeuralIL(flax.linen.Module):
         results = self.denormalizer(results)
         return (one_type >= 0) * jnp.squeeze(results)
 
-    def calc_atomic_energies(self, positions, types, cell):
+    def calc_atomic_energies(self, positions, types, cell, max_neighbors):
         """Compute the atomic contributions to the potential energy.
 
         Args:
@@ -563,17 +565,27 @@ class NeuralIL(flax.linen.Module):
                 boundary conditions are in effect. If it is not periodic along
                 one or more directions, signal that fact with one of more zero
                 vectors.
+            max_neighbors: Buffer size for the neighbor list inside the
+                descriptor generator. Static at trace time.
 
         Returns:
             The n_atoms contributions to the energy.
         """
-        descriptors = self.descriptor_generator(positions, types, cell)
+        descriptors = self.descriptor_generator(
+            positions, types, cell, max_neighbors
+        )
         return (types >= 0) * self.calc_atomic_energies_from_descriptors(
             descriptors, types
         )
 
     def calc_some_atomic_energies(
-        self, some_positions, some_types, all_positions, all_types, cell
+        self,
+        some_positions,
+        some_types,
+        all_positions,
+        all_types,
+        cell,
+        max_neighbors,
     ):
         """Compute some of the atomic contributions to the potential energy.
 
@@ -594,18 +606,20 @@ class NeuralIL(flax.linen.Module):
                 boundary conditions are in effect. If it is not periodic along
                 one or more directions, signal that fact with one of more zero
                 vectors.
+            max_neighbors: Buffer size for the neighbor list inside the
+                descriptor generator. Static at trace time.
 
         Returns:
             The n_atoms contributions to the energy.
         """
         some_descriptors = self.partial_descriptor_generator(
-            all_positions, all_types, some_positions, cell
+            all_positions, all_types, some_positions, cell, max_neighbors
         )
         return (some_types >= 0) * self.calc_atomic_energies_from_descriptors(
             some_descriptors, some_types
         )
 
-    def calc_potential_energy(self, positions, types, cell):
+    def calc_potential_energy(self, positions, types, cell, max_neighbors):
         """Compute the total potential energy of the system.
 
         Args:
@@ -616,14 +630,18 @@ class NeuralIL(flax.linen.Module):
                 boundary conditions are in effect. If it is not periodic along
                 one or more directions, signal that fact with one of more zero
                 vectors.
+            max_neighbors: Buffer size for the neighbor list inside the
+                descriptor generator. Static at trace time.
 
         Returns:
             The sum of all atomic contributions to the potential energy.
         """
-        contributions = self.calc_atomic_energies(positions, types, cell)
+        contributions = self.calc_atomic_energies(
+            positions, types, cell, max_neighbors
+        )
         return jnp.squeeze(contributions.sum(axis=0))
 
-    def calc_forces(self, positions, types, cell):
+    def calc_forces(self, positions, types, cell, max_neighbors):
         """Compute the force on each atom.
 
         Args:
@@ -634,13 +652,17 @@ class NeuralIL(flax.linen.Module):
                 boundary conditions are in effect. If it is not periodic along
                 one or more directions, signal that fact with one of more zero
                 vectors.
+            max_neighbors: Buffer size for the neighbor list inside the
+                descriptor generator. Static at trace time.
 
         Returns:
             The (n_atoms, 3) vector containing all the forces.
         """
-        return -self._calc_gradient(positions, types, cell)
+        return -self._calc_gradient(positions, types, cell, max_neighbors)
 
-    def calc_potential_energy_and_forces(self, positions, types, cell):
+    def calc_potential_energy_and_forces(
+        self, positions, types, cell, max_neighbors
+    ):
         """Compute the total potential energy and all the forces.
 
         Args:
@@ -651,6 +673,8 @@ class NeuralIL(flax.linen.Module):
                 boundary conditions are in effect. If it is not periodic along
                 one or more directions, signal that fact with one of more zero
                 vectors.
+            max_neighbors: Buffer size for the neighbor list inside the
+                descriptor generator. Static at trace time.
 
         Returns:
             A two-element tuple. The first element is the sum of all atomic
@@ -658,7 +682,7 @@ class NeuralIL(flax.linen.Module):
             (n_atoms, 3) vector containing all the forces.
         """
         energy, gradient = self._calc_value_and_gradient(
-            positions, types, cell
+            positions, types, cell, max_neighbors
         )
         return (energy, -gradient)
 
@@ -712,8 +736,10 @@ class NeuralILwithMorse(flax.linen.Module):
             self.calc_potential_energy, argnums=0
         )
 
-    def calc_combined_inputs(self, positions, types, cell):
-        descriptors = self.descriptor_generator(positions, types, cell)
+    def calc_combined_inputs(self, positions, types, cell, max_neighbors):
+        descriptors = self.descriptor_generator(
+            positions, types, cell, max_neighbors
+        )
         embeddings = self.embed(types)
         combined_inputs = self.mixer(descriptors, embeddings)
         return combined_inputs
@@ -759,7 +785,7 @@ class NeuralILwithMorse(flax.linen.Module):
         results = self.denormalizer(results)
         return (one_type >= 0) * jnp.squeeze(results)
 
-    def calc_atomic_energies(self, positions, types, cell):
+    def calc_atomic_energies(self, positions, types, cell, max_neighbors):
         """Compute the atomic contributions to the potential energy.
 
         Args:
@@ -770,11 +796,15 @@ class NeuralILwithMorse(flax.linen.Module):
                 boundary conditions are in effect. If it is not periodic along
                 one or more directions, signal that fact with one of more zero
                 vectors.
+            max_neighbors: Buffer size for the neighbor list inside the
+                descriptor generator. Static at trace time.
 
         Returns:
             The n_atoms contributions to the energy.
         """
-        descriptors = self.descriptor_generator(positions, types, cell)
+        descriptors = self.descriptor_generator(
+            positions, types, cell, max_neighbors
+        )
         nn_contributions = self.calc_atomic_energies_from_descriptors(
             descriptors, types
         )
@@ -806,7 +836,13 @@ class NeuralILwithMorse(flax.linen.Module):
         return (types >= 0) * morse_contributions
 
     def calc_some_atomic_energies(
-        self, some_positions, some_types, all_positions, all_types, cell
+        self,
+        some_positions,
+        some_types,
+        all_positions,
+        all_types,
+        cell,
+        max_neighbors,
     ):
         """Compute some of the atomic contributions to the potential energy.
 
@@ -827,12 +863,14 @@ class NeuralILwithMorse(flax.linen.Module):
                 boundary conditions are in effect. If it is not periodic along
                 one or more directions, signal that fact with one of more zero
                 vectors.
+            max_neighbors: Buffer size for the neighbor list inside the
+                descriptor generator. Static at trace time.
 
         Returns:
             The n_atoms contributions to the energy.
         """
         some_descriptors = self.partial_descriptor_generator(
-            all_positions, all_types, some_positions, cell
+            all_positions, all_types, some_positions, cell, max_neighbors
         )
         nn_contributions = self.calc_atomic_energies_from_descriptors(
             some_descriptors, some_types
@@ -877,7 +915,7 @@ class NeuralILwithMorse(flax.linen.Module):
         )
         return (some_types >= 0) * morse_contributions
 
-    def calc_potential_energy(self, positions, types, cell):
+    def calc_potential_energy(self, positions, types, cell, max_neighbors):
         """Compute the total potential energy of the system.
 
         Args:
@@ -888,14 +926,18 @@ class NeuralILwithMorse(flax.linen.Module):
                 boundary conditions are in effect. If it is not periodic along
                 one or more directions, signal that fact with one of more zero
                 vectors.
+            max_neighbors: Buffer size for the neighbor list inside the
+                descriptor generator. Static at trace time.
 
         Returns:
             The sum of all atomic contributions to the potential energy.
         """
-        contributions = self.calc_atomic_energies(positions, types, cell)
+        contributions = self.calc_atomic_energies(
+            positions, types, cell, max_neighbors
+        )
         return jnp.squeeze(contributions.sum(axis=0))
 
-    def calc_forces(self, positions, types, cell):
+    def calc_forces(self, positions, types, cell, max_neighbors):
         """Compute the force on each atom.
 
         Args:
@@ -906,13 +948,17 @@ class NeuralILwithMorse(flax.linen.Module):
                 boundary conditions are in effect. If it is not periodic along
                 one or more directions, signal that fact with one of more zero
                 vectors.
+            max_neighbors: Buffer size for the neighbor list inside the
+                descriptor generator. Static at trace time.
 
         Returns:
             The (n_atoms, 3) vector containing all the forces.
         """
-        return -self._calc_gradient(positions, types, cell)
+        return -self._calc_gradient(positions, types, cell, max_neighbors)
 
-    def calc_potential_energy_and_forces(self, positions, types, cell):
+    def calc_potential_energy_and_forces(
+        self, positions, types, cell, max_neighbors
+    ):
         """Compute the total potential energy and all the forces.
 
         Args:
@@ -923,6 +969,8 @@ class NeuralILwithMorse(flax.linen.Module):
                 boundary conditions are in effect. If it is not periodic along
                 one or more directions, signal that fact with one of more zero
                 vectors.
+            max_neighbors: Buffer size for the neighbor list inside the
+                descriptor generator. Static at trace time.
 
         Returns:
             A two-element tuple. The first element is the sum of all atomic
@@ -930,7 +978,7 @@ class NeuralILwithMorse(flax.linen.Module):
             (n_atoms, 3) vector containing all the forces.
         """
         energy, gradient = self._calc_value_and_gradient(
-            positions, types, cell
+            positions, types, cell, max_neighbors
         )
         return (energy, -gradient)
 
