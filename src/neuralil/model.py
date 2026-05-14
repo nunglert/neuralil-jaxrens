@@ -111,6 +111,99 @@ def calc_morse_mixing_radii(radii, abd_probe, abd_source):
     ) / (a_probe + a_source)
 
 
+class RepulsiveMorseModel(flax.linen.Module):
+    """Trainable repulsive Morse potential with per-element parameters.
+
+    The potential function is parameterized as
+
+    phi(r) = d * exp(-2 * a * (r - b))
+
+    multiplied by a switching function with a fixed cutoff radius and a
+    trainable switching radius to guarantee the smoothness of the forces.
+
+    The parameters (a, b, d) are extracted from a three-component embedding
+    vector v as
+    a = a_min + softplus(v[0])
+    b = b_min + softplus(v[1])
+    d = d_min + softplus(v[2])
+    to guarantee their positivity. The interaction between two atoms, of
+    elements a and b, contributes a potential energy
+
+    E_pot = .5 * (phi[v_a](2 * r1) + phi[v_b](2 * r2))
+
+    For the meaning of r1 and r2, see the docstring of the function
+    calc_morse_mixing_radius().
+
+    Args:
+        n_types: The number of atom types in the system.
+        r_cut: The cutoff radius.
+        a_min: The minimum possible value for the parameter a.
+        b_min: The minimum possible value for the parameter b.
+        d_min: The minimum possible value for the parameter d.
+    """
+
+    n_types: int
+    r_cut: float
+    a_min: float
+    b_min: float
+    d_min: float
+
+    def setup(self):
+        self.switch_param = self.param(
+            "switch_param", jax.nn.initializers.lecun_normal(), (1, 1)
+        )
+        self.embed = flax.linen.Embed(self.n_types, 3)
+
+    def calc_atomic_energies(self, radii, probe_types, source_types):
+        """Compute the Morse repulsive contributions to the potential energy.
+
+        Two groups of atoms can be specified: the "source" atoms that take part
+        in the interacions and the "probe" atoms whose energies we compute.
+        They can partially or completely overlap.
+
+        Args:
+            radii: The (n_probe, n_source) matrix of interatomic distances.
+            probe_types: The atom types of the "probe" atoms, codified as
+                integers from 0 to n_types - 1.
+            source_types: The atom types of the "source" atoms, codified as
+                integers from 0 to n_types - 1.
+
+        Returns:
+            The n_probe contributions to the energy from the "probe" atoms.
+        """
+        mask = jnp.logical_or(
+            probe_types[:, jnp.newaxis] < 0, source_types[jnp.newaxis, :] < 0
+        )
+        radii = radii + 2.0 * mask * self.r_cut
+        abd_probe = jnp.array([self.a_min, self.b_min, self.d_min])[
+            jnp.newaxis, :
+        ] + jax.nn.softplus(self.embed(probe_types))
+        abd_source = jnp.array([self.a_min, self.b_min, self.d_min])[
+            jnp.newaxis, :
+        ] + jax.nn.softplus(self.embed(source_types))
+        r_morse = calc_morse_mixing_radii(radii, abd_probe, abd_source)
+
+        a = abd_probe[:, 0]
+        b = abd_probe[:, 1]
+        d = abd_probe[:, 2]
+        contributions = d[:, jnp.newaxis] * jnp.exp(
+            -2.0 * a[:, jnp.newaxis] * (2.0 * r_morse - b[:, jnp.newaxis])
+        )
+        # Zero out the contribution from the interaction of each atom with
+        # itself. This trick only works with potentials that can be safely
+        # evaluated at r=0.
+        contributions *= jnp.logical_not(jnp.isclose(0.0, radii))
+        # The switching radius will always lie between r_cut / 2. and r_cut, to
+        # avoid nonsensical situations.
+        r_switch = (
+            0.5
+            * (1.0 + jax.nn.sigmoid(jnp.squeeze(self.switch_param)))
+            * self.r_cut
+        )
+        cutoffs = smooth_cutoff(radii, r_switch, self.r_cut)
+        return 0.5 * (cutoffs * contributions).sum(axis=1)
+
+
 class MorseModel(flax.linen.Module):
     """Trainable Morse potential with per-element parameters.
 
@@ -720,12 +813,23 @@ class NeuralILwithMorse(flax.linen.Module):
         [d.reshape((d.shape[0], -1)), e], axis=1
     )
     model_name: ClassVar[str] = "NeuralIL+Morse"
+    morse_type: str = "RepulsiveMorse"
     model_version: ClassVar[str] = "0.5"
     neuralil_version: ClassVar[str] = package_version
 
     def setup(self):
         # This model takes care of the Morse part of the potential.
-        self.morse = MorseModel(self.n_types, self.r_cut)
+        if self.morse_type == "RepulsiveMorse":
+            self.morse = RepulsiveMorseModel(
+                self.n_types, self.r_cut, 1e-2, 1e-2, 1e-2
+            )
+        elif self.morse_type == "Morse":
+            self.morse = MorseModel(self.n_types, self.r_cut)
+        else:
+            raise ValueError(
+                f"morse_type must be 'RepulsiveMorse' or 'Morse'; "
+                f"got {self.morse_type!r}"
+            )
         # These neurons create the embedding vector.
         self.embed = flax.linen.Embed(self.n_types, self.embed_d)
         # This linear layer centers and scales the energy after the core

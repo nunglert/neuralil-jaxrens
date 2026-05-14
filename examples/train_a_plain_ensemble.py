@@ -388,7 +388,7 @@ for i_epoch in range(N_EPOCHS):
             sorted_elements=sorted_elements,
             embed_d=EMBED_D,
             core_widths=CORE_WIDTHS,
-            constructor_kwargs=dict(),
+            constructor_kwargs={"morse_type": individual_model.morse_type},
             random_seed=run_seed,
             params=flax.serialization.to_state_dict(
                 pack_params([m[0] for m in to_be_saved])
