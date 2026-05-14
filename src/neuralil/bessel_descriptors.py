@@ -427,6 +427,22 @@ class PowerSpectrumGenerator:
         self._triu_indices = jnp.triu_indices(self._n_types)
         # Number of angular descriptors for each l.
         self._degeneracies = jnp.arange(self._n_max + 1, 0, -1)
+        # Precomputed gather indices that reproduce
+        # ``np.repeat(arange(n_max+1), _degeneracies)``.  Used in the
+        # hot path below in place of ``jnp.repeat(values, _degeneracies)``
+        # so the (otherwise static) cumsum that ``jnp.repeat`` lowers to
+        # is not replicated across every vmap cell at trace time —
+        # XLA's constant-folder grinds on that for many seconds per
+        # compile in deeper vmap stacks (see
+        # ``probe_descriptor_compile.py`` for the reproducer).
+        # Built in eager NumPy so constructor never touches a JAX device.
+        self._repeat_indices = jnp.asarray(
+            onp.repeat(
+                onp.arange(self._n_max + 1, dtype=onp.int32),
+                onp.asarray(self._degeneracies, dtype=onp.int32),
+            ),
+            dtype=jnp.int32,
+        )
         # Supercell expansion to be used when computing descriptors.
         self.sc_a = supercell_diag[0]
         self.sc_b = supercell_diag[1]
@@ -570,7 +586,11 @@ class PowerSpectrumGenerator:
                 jnp.isclose(denominator, 0.0), 0.0, cos_theta
             )
             legendre = self._angular(cos_theta)
-            kernel = jnp.repeat(prefactors * legendre, self._degeneracies)
+            # Equivalent to ``jnp.repeat(prefactors * legendre, self._degeneracies)``
+            # but expressed as a plain gather over a precomputed index array
+            # (see ``self._repeat_indices`` in ``__init__``).  The gather form
+            # avoids XLA constant-folding a per-vmap-cell cumsum.
+            kernel = (prefactors * legendre)[self._repeat_indices]
             nruter = gs_p * kernel
             return nruter
 
