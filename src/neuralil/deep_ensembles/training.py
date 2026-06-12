@@ -363,7 +363,7 @@ def unpack_params(model_params):
     n_models = get_n_models(model_params)
     nruter = []
     for i_model in range(n_models):
-        subparams = jax.tree_map(operator.itemgetter(i_model), model_params)
+        subparams = jax.tree_util.tree_map(operator.itemgetter(i_model), model_params)
         individual_params = dict(params=subparams["params"]["h_neuralil"])
         nruter.append(flax.core.freeze(individual_params))
     return nruter
@@ -371,7 +371,7 @@ def unpack_params(model_params):
 
 def pack_params(list_of_params):
     "Compile a set of ensemble parameters from a list of individual parameters."
-    merged_params = jax.tree_map(
+    merged_params = jax.tree_util.tree_map(
         lambda *args: jnp.stack(list(args), axis=0), *list_of_params
     )
     nruter = dict(params=dict(h_neuralil=merged_params["params"]))

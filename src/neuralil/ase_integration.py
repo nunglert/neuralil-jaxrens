@@ -27,6 +27,7 @@ jax.config.update("jax_platform_name", "cpu")
 import flax.serialization
 import jax.numpy as jnp
 import jax.random
+import jax.tree_util
 from ase.calculators.calculator import Calculator, compare_atoms
 
 from neuralil.bessel_descriptors import (
@@ -96,7 +97,7 @@ class NeuralILASECalculator(Calculator):
         )
         # NOTE: I do not fully understand why this cast is necesary, or rather
         # why from_state_dict does not take care of it.
-        self.params = jax.tree_map(
+        self.params = jax.tree_util.tree_map(
             jnp.asarray,
             flax.serialization.from_state_dict(
                 template_params, model_info.params

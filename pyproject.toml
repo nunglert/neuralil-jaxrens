@@ -43,7 +43,13 @@ dynamic = ["version"]
 [project.optional-dependencies]
 velo = [
     "learned-optimization @ git+https://github.com/google/learned_optimization.git"
-]         
+]
+test = [
+    "pytest"
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
