@@ -13,22 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# This module implements a calculator intended to be run on multicore nodes.
+# An ASE calculator for NeuralIL force fields, single-model or ensemble.
 
 import copy
 
 import jax
-import numpy as onp
 
-# Since this module uses jax.pmap, we tell ASE to run on the CPU. We try to do
-# it as early as possible.
-# FIXME: Handle this from the command line.
-jax.config.update("jax_platform_name", "cpu")
-import flax.serialization
+# Keep ASE evaluations on the CPU; do it as early as possible.
+# jax.config.update("jax_platform_name", "cpu")
 import jax.numpy as jnp
-import jax.random
-import jax.tree_util
-from ase.calculators.calculator import Calculator, compare_atoms
+import numpy as onp
+from ase.calculators.calculator import Calculator
 
 from neuralil.bessel_descriptors import (
     PowerSpectrumGenerator,
@@ -37,181 +32,372 @@ from neuralil.bessel_descriptors import (
 from neuralil.model import NeuralILModelInfo
 
 
-# TODO: Add more docstrings to this class.
-class NeuralILASECalculator(Calculator):
-    """Basic ASE Calculator based on the NeuralIL force field.
+def pick_bucket(true_max, ladder, offset=0):
+    """Smallest ladder entry that accommodates ``true_max + offset``.
+
+    Discretising the observed neighbour count onto a fixed ladder bounds the
+    number of distinct JIT compilations to ``len(ladder)`` -- the same idea as
+    jaxrens' bucket manager, but without the shrink/hysteresis half (evaluation
+    here is static, so there is nothing to roll back). Raises when the ladder
+    is exhausted, which is user-actionable (extend ``max_neighbors_list``).
+    """
+    target = int(true_max) + int(offset)
+    for b in ladder:
+        if b >= target:
+            return int(b)
+    raise RuntimeError(
+        f"Observed max neighbour count {int(true_max)} (+offset {offset}) "
+        f"needs a bucket >= {target}, but max_neighbors_list={list(ladder)} "
+        "has no entry that large. Extend it."
+    )
+
+
+def build_model_from_info(model_info, supercell_diag=(1, 1, 1), ensemble=True):
+    """Reconstruct a NeuralIL model (single or ensemble) from its model info.
+
+    Mirrors the training-time construction: a shared descriptor generator and
+    ResNet core, optionally wrapped in the plain ensemble. ``max_neighbors`` is
+    *not* baked in -- it is supplied at each evaluation.
 
     Args:
-        model: The Flax model that calculates total energies and forces.
-        model_info: A NeuralILModelInfo with all relevant information and the
-            model parameters.
-        max_neighbors: The maximum number of neighbors that the descriptor
-            generator will be able to handle.
-        n_devices: The number of shards to be used when paralelizing with
-            jax.pmap(). If not specified, it will be taken from JAX.
+        model_info: A :class:`~neuralil.model.NeuralILModelInfo`, or a path to a
+            pickle of one.
+        supercell_diag: Diagonal supercell replication for the descriptor
+            generator (for cells smaller than the cutoff sphere).
+        ensemble: If True (default, the NNFF convention), wrap the model in a
+            ``PlainEnsemble``; if False, return the single NeuralIL model.
 
+    Returns:
+        ``(model_info, model)``.
+    """
+    import pickle
+
+    from neuralil.model import NeuralIL, NeuralILwithMorse, ResNetCore
+    from neuralil.plain_ensembles.model import (
+        PlainEnsemble,
+        PlainEnsemblewithMorse,
+    )
+    from neuralil.plain_ensembles.training import get_n_models
+
+    if not isinstance(model_info, NeuralILModelInfo):
+        model_info = pickle.load(open(model_info, "rb"))
+
+    descriptor_generator = PowerSpectrumGenerator(
+        model_info.n_max,
+        model_info.r_cut,
+        len(model_info.sorted_elements),
+        tuple(supercell_diag),
+    )
+    core_model = ResNetCore(model_info.core_widths)
+    # An ensemble nests the wrapped NeuralIL params under "neuralil"; a single
+    # model's params are flat. Look at whichever holds the NeuralIL submodules.
+    top = model_info.params["params"]
+    neuralil_params = top["neuralil"] if "neuralil" in top else top
+    with_morse = "morse" in neuralil_params
+
+    if with_morse:
+        individual = NeuralILwithMorse(
+            len(model_info.sorted_elements),
+            model_info.embed_d,
+            model_info.r_cut,
+            descriptor_generator,
+            descriptor_generator.process_some_data,
+            core_model,
+            morse_type="RepulsiveMorse",
+        )
+    else:
+        individual = NeuralIL(
+            len(model_info.sorted_elements),
+            model_info.embed_d,
+            model_info.r_cut,
+            descriptor_generator,
+            descriptor_generator.process_some_data,
+            core_model,
+        )
+
+    if not ensemble:
+        return model_info, individual
+
+    n_models = get_n_models(model_info.params)
+    wrapper = PlainEnsemblewithMorse if with_morse else PlainEnsemble
+    return model_info, wrapper(individual, n_models)
+
+
+class NeuralILASECalculator(Calculator):
+    """ASE calculator for a NeuralIL force field -- single model *or* ensemble.
+
+    Both model types expose the same
+    ``calc_potential_energy``/``calc_forces(positions, types, cell,
+    max_neighbors)`` interface. An ensemble
+    (:class:`~neuralil.plain_ensembles.model.PlainEnsemble`) returns a leading
+    per-model axis; this calculator detects that (the module carries an
+    ``n_models`` attribute), reduces it to the mean, and reports the ensemble
+    spread as an uncertainty (``energy_uncert``, ``energy_uncert_relative``,
+    ``forces_uncert``). A single model is an ensemble of one -- no reduction.
+
+    **Neighbour buckets.** ``max_neighbors`` is a static (shape-determining)
+    argument of the model, so a distinct value forces a recompile. Rather than
+    fix one value, pass ``max_neighbors_list`` (a ladder); each evaluation picks
+    the smallest bucket that fits the structure's actual neighbour count (plus
+    ``neighbor_offset`` headroom), bounding recompiles to ``len(ladder)``. A
+    lone ``max_neighbors`` is just a one-entry ladder.
+
+    **Batched evaluation.** :meth:`evaluate` scores many structures at once via
+    ``vmap``, chunked by ``batch_size`` so memory stays bounded, and optionally
+    sharded across local devices with ``pmap`` (``shard=True``). Structures are
+    padded to a common atom count with ignored ``type=-1`` atoms, so a batch may
+    mix sizes.
+
+    Args:
+        model: A ``NeuralIL`` (single) or ``PlainEnsemble`` (ensemble) module.
+        model_info: The matching :class:`~neuralil.model.NeuralILModelInfo`.
+        max_neighbors: A single neighbour cap (a one-entry ladder). Provide this
+            or ``max_neighbors_list``.
+        max_neighbors_list: Bucket ladder (ascending) for dynamic selection.
+        neighbor_offset: Headroom added to the observed count before bucketing.
+        n_devices: Devices to shard over in :meth:`evaluate` (defaults to all
+            local devices).
     """
 
     implemented_properties = ("energy", "forces")
     excluded_properties = ("initial_charges", "initial_magmoms")
 
-    _ADAMS_NUMBER = 42
-
-    def __init__(self, model, model_info, max_neighbors, n_devices=None):
+    def __init__(
+        self,
+        model,
+        model_info,
+        max_neighbors=None,
+        max_neighbors_list=None,
+        neighbor_offset=0,
+        n_devices=None,
+    ):
         self.calculator_results = dict()
         if not isinstance(model_info, NeuralILModelInfo):
             raise ValueError(
-                "model_info must be a instance of NeuralILModelInfo"
+                "model_info must be an instance of NeuralILModelInfo"
             )
-        if (
-            model.model_name != model_info.model_name
-            or model.model_version != model_info.model_version
-        ):
-            raise ValueError("model_info does not match the provided model")
-        self.pipeline = PowerSpectrumGenerator(
-            model_info.n_max,
-            model_info.r_cut,
-            len(model_info.sorted_elements),
-        )
+        if max_neighbors_list:
+            self.ladder = tuple(sorted(int(b) for b in max_neighbors_list))
+        elif max_neighbors is not None:
+            self.ladder = (int(max_neighbors),)
+        else:
+            raise ValueError(
+                "provide max_neighbors or max_neighbors_list"
+            )
+        self.neighbor_offset = int(neighbor_offset)
+        self.max_neighbors = self.ladder[-1]  # largest bucket (compat)
+
         self.model = model
         self.model_info = copy.deepcopy(model_info)
-        self.max_neighbors = max_neighbors
-        if n_devices is None:
-            self.n_devices = len(jax.local_devices())
-        else:
-            self.n_devices = n_devices
-        # TODO: that this way of mapping elements to atom types may not match
-        # the convention used in some highly custom scripts. Generalize it.
+        self.params = model_info.params
+        # PlainEnsemble carries ``n_models``; a single NeuralIL does not.
+        self.is_ensemble = hasattr(model, "n_models")
         self.symbol_map = {
             s: i for i, s in enumerate(model_info.sorted_elements)
         }
-        # We can initialize the model parameters using dummy positions and
-        # types because the number of atoms is immaterial.
-        template_params = self.model.init(
-            jax.random.PRNGKey(0),
-            jnp.zeros((type(self)._ADAMS_NUMBER, 3)),
-            jnp.zeros(type(self)._ADAMS_NUMBER, dtype=jnp.asarray(1).dtype),
-            jnp.eye(3),
-            self.max_neighbors,
-            method=self.model.calc_forces,
-        )
-        # NOTE: I do not fully understand why this cast is necesary, or rather
-        # why from_state_dict does not take care of it.
-        self.params = jax.tree_util.tree_map(
-            jnp.asarray,
-            flax.serialization.from_state_dict(
-                template_params, model_info.params
-            ),
-        )
-
-        # This could be implemented as an ordinary method, but there have
-        # been bugs in JAX triggering repeated recompilation of arguments
-        # to pmap, so it is better to play it safe.
-        self._energy_worker = jax.pmap(
-            self._serial_energy_worker, in_axes=(0, 0, None, None, None)
-        )
+        self.n_devices = n_devices or len(jax.local_devices())
+        # Compiled functions are cached per (bucket, forces?, batched?, shard?).
+        self._fn_cache = {}
         super().__init__()
 
-    def _serial_energy_worker(
-        self, partial_p, partial_t, positions, types, cell
+    @classmethod
+    def from_pickle(
+        cls,
+        model_info,
+        max_neighbors=None,
+        max_neighbors_list=None,
+        neighbor_offset=0,
+        supercell_diag=(1, 1, 1),
+        ensemble=True,
+        n_devices=None,
     ):
-        return self.model.apply(
-            self.params,
-            partial_p,
-            partial_t,
-            positions,
-            types,
-            cell,
-            self.max_neighbors,
-            method=self.model.calc_some_atomic_energies,
+        """Build the calculator from a pickled ``NeuralILModelInfo`` (or an info
+        object). ``ensemble`` selects a ``PlainEnsemble`` (the NNFF default,
+        giving uncertainties) versus a single model.
+        """
+        info, model = build_model_from_info(
+            model_info, supercell_diag=supercell_diag, ensemble=ensemble
+        )
+        return cls(
+            model,
+            info,
+            max_neighbors=max_neighbors,
+            max_neighbors_list=max_neighbors_list,
+            neighbor_offset=neighbor_offset,
+            n_devices=n_devices,
         )
 
-    def _calc_atomic_energies(self, p, t, c):
-        p = jnp.asarray(p)
-        t = jnp.asarray(t)
-        c = jnp.asarray(c)
-        n_atoms = p.shape[0]
-        n_atoms_original = n_atoms
-        padding = self.n_devices - n_atoms % self.n_devices
-        padded_p = jnp.pad(p, ((0, padding), (0, 0)))
-        padded_t = jnp.pad(t, (0, padding), "constant", constant_values=-1)
-        n_atoms = padded_p.shape[0]
-
-        padded_p = padded_p.reshape(
-            (self.n_devices, n_atoms // self.n_devices, 3)
+    # -- compiled-function factory ---------------------------------------
+    def _apply(self, bucket, forces):
+        """A single-structure ``apply`` closed over a bucket (no jit/vmap)."""
+        method = (
+            self.model.calc_forces
+            if forces
+            else self.model.calc_potential_energy
         )
-        padded_t = padded_t.reshape(
-            (self.n_devices, n_atoms // self.n_devices)
-        )
-        nruter = self._energy_worker(padded_p, padded_t, p, t, c)
-        nruter = nruter.reshape(
-            tuple([nruter.shape[0] * nruter.shape[1]] + list(nruter.shape[2:]))
-        )
-        return nruter[:n_atoms_original]
 
-    def _calc_potential_energy(self, p, t, c):
-        return self._calc_atomic_energies(p, t, c).sum(axis=-1).mean()
+        def apply(positions, types, cell):
+            return self.model.apply(
+                self.params, positions, types, cell, bucket, method=method
+            )
 
-    def _calc_forces(self, p, t, c):
-        return -jax.grad(self._calc_potential_energy, argnums=0)(p, t, c)
+        return apply
 
-    def get_potential_energy(self, atoms, *args, **kwargs):
-        if not self.calculation_required(atoms, "energy"):
-            return self.calculator_results["energy"]
-        self.atoms = atoms
-        jtypes = jnp.asarray([self.symbol_map[s] for s in atoms.symbols])
+    def _single_fn(self, bucket, forces):
+        key = ("single", bucket, forces)
+        fn = self._fn_cache.get(key)
+        if fn is None:
+            fn = jax.jit(self._apply(bucket, forces))
+            self._fn_cache[key] = fn
+        return fn
+
+    def _batched_fn(self, bucket, forces, sharded):
+        key = ("batch", bucket, forces, sharded)
+        fn = self._fn_cache.get(key)
+        if fn is None:
+            vmapped = jax.vmap(self._apply(bucket, forces), in_axes=(0, 0, 0))
+            fn = jax.pmap(vmapped) if sharded else jax.jit(vmapped)
+            self._fn_cache[key] = fn
+        return fn
+
+    # -- neighbour bucketing ---------------------------------------------
+    def _bucket_for(self, positions, jtypes, cell):
         n_neighbors = get_max_number_of_neighbors(
-            jnp.asarray(self.atoms.positions),
+            positions, jtypes, self.model_info.r_cut, cell
+        )
+        return pick_bucket(int(n_neighbors), self.ladder, self.neighbor_offset)
+
+    def _parse(self, atoms):
+        jtypes = jnp.asarray([self.symbol_map[s] for s in atoms.symbols])
+        return (
+            jnp.asarray(atoms.positions),
             jtypes,
-            self.model_info.r_cut,
-            jnp.asarray(self.atoms.cell[...]),
+            jnp.asarray(atoms.cell[...]),
         )
-        if n_neighbors > self.max_neighbors:
-            raise ValueError(
-                f"{n_neighbors} exceed max_neighbors={self.max_neighbors}"
+
+    # -- ASE single-structure interface ----------------------------------
+    def get_potential_energy(self, atoms, *args, **kwargs):
+        positions, jtypes, cell = self._parse(atoms)
+        bucket = self._bucket_for(positions, jtypes, cell)
+        energy = self._single_fn(bucket, False)(positions, jtypes, cell)
+        if self.is_ensemble:
+            value = float(energy.mean())
+            uncert = float(energy.std())
+            atoms.info["energy_uncert"] = uncert
+            atoms.info["energy_uncert_relative"] = (
+                uncert / abs(value) if value else uncert
             )
-        result = float(
-            self._calc_potential_energy(
-                self.atoms.positions, jtypes, self.atoms.cell[...]
-            )
-        )
-        self.calculator_results["energy"] = result
-        return result
+            return value
+        return float(energy)
 
     def get_forces(self, atoms, *args, **kwargs):
-        if not self.calculation_required(atoms, "forces"):
-            return self.calculator_results["forces"]
-        self.atoms = atoms
-        jtypes = jnp.asarray([self.symbol_map[s] for s in atoms.symbols])
-        n_neighbors = get_max_number_of_neighbors(
-            jnp.asarray(self.atoms.positions),
-            jtypes,
-            self.model_info.r_cut,
-            jnp.asarray(self.atoms.cell[...]),
-        )
-        if n_neighbors > self.max_neighbors:
-            raise ValueError(
-                f"{n_neighbors} exceed max_neighbors={self.max_neighbors}"
-            )
-        result = onp.array(
-            self._calc_forces(
-                self.atoms.positions, jtypes, self.atoms.cell[...]
-            )
-        )
-        self.calculator_results["forces"] = result
-        return result
+        positions, jtypes, cell = self._parse(atoms)
+        bucket = self._bucket_for(positions, jtypes, cell)
+        forces = self._single_fn(bucket, True)(positions, jtypes, cell)
+        if self.is_ensemble:
+            atoms.info["forces_uncert"] = float(jnp.std(forces, axis=0).sum())
+            forces = forces.mean(axis=0)
+        return onp.array(forces)
 
-    def calculation_required(self, atoms, properties):
-        for p in properties:
-            if p not in self.implemented_properties:
-                return True
-        return (
-            len(
-                compare_atoms(
-                    self.atoms,
-                    atoms,
-                    excluded_properties=self.excluded_properties,
-                )
+    # -- batched evaluation ----------------------------------------------
+    def evaluate(self, atoms_list, batch_size=None, shard=False):
+        """Energies + forces (+ uncertainties) for many structures at once.
+
+        Runs a ``vmap`` over the batch, chunked to at most ``batch_size``
+        structures so peak memory is bounded, and -- when ``shard`` -- splits
+        each chunk across ``n_devices`` with ``pmap``. Structures are padded to
+        a common atom count with ignored ``type=-1`` atoms and a single bucket
+        (the max over the batch) is used, so a batch may mix sizes/densities.
+
+        Args:
+            atoms_list: Structures to evaluate.
+            batch_size: Max structures per ``vmap`` (default: all of them).
+            shard: Split each chunk across local devices with ``pmap``.
+
+        Returns:
+            A list of per-structure dicts with ``energy`` and ``forces`` (and,
+            for an ensemble, ``energy_uncert``/``energy_uncert_relative`` and
+            ``forces_uncert``). Forces are trimmed back to each structure's own
+            atom count.
+        """
+        n_struct = len(atoms_list)
+        if n_struct == 0:
+            return []
+        n_atoms = max(len(a) for a in atoms_list)
+
+        P = onp.zeros((n_struct, n_atoms, 3))
+        T = -onp.ones((n_struct, n_atoms), dtype=int)  # -1 = ignored padding
+        C = onp.zeros((n_struct, 3, 3))
+        counts = onp.zeros(n_struct, dtype=int)
+        true_max = 0
+        for i, a in enumerate(atoms_list):
+            na = len(a)
+            counts[i] = na
+            P[i, :na] = a.positions
+            T[i, :na] = [self.symbol_map[s] for s in a.symbols]
+            C[i] = a.cell[...]
+            n_nb = get_max_number_of_neighbors(
+                jnp.asarray(a.positions),
+                jnp.asarray(T[i, :na]),
+                self.model_info.r_cut,
+                jnp.asarray(a.cell[...]),
             )
-            > 0
-        )
+            true_max = max(true_max, int(n_nb))
+        bucket = pick_bucket(true_max, self.ladder, self.neighbor_offset)
+
+        n_dev = self.n_devices if shard else 1
+        batch_size = batch_size or n_struct
+
+        e_chunks, f_chunks = [], []
+        for start in range(0, n_struct, batch_size):
+            p = P[start : start + batch_size]
+            t = T[start : start + batch_size]
+            c = C[start : start + batch_size]
+            b = p.shape[0]
+            if n_dev > 1:
+                pad = (-b) % n_dev
+                if pad:  # replicate the last structure to fill the device grid
+                    p = onp.concatenate([p, onp.repeat(p[-1:], pad, 0)])
+                    t = onp.concatenate([t, onp.repeat(t[-1:], pad, 0)])
+                    c = onp.concatenate([c, onp.repeat(c[-1:], pad, 0)])
+                per = (b + pad) // n_dev
+                rs = lambda x: jnp.asarray(x).reshape(n_dev, per, *x.shape[1:])
+                e = self._batched_fn(bucket, False, True)(rs(p), rs(t), rs(c))
+                f = self._batched_fn(bucket, True, True)(rs(p), rs(t), rs(c))
+                e = e.reshape(-1, *e.shape[2:])[:b]
+                f = f.reshape(-1, *f.shape[2:])[:b]
+            else:
+                p, t, c = jnp.asarray(p), jnp.asarray(t), jnp.asarray(c)
+                e = self._batched_fn(bucket, False, False)(p, t, c)
+                f = self._batched_fn(bucket, True, False)(p, t, c)
+            e_chunks.append(e)
+            f_chunks.append(f)
+
+        E = onp.asarray(jnp.concatenate(e_chunks, axis=0))
+        F = onp.asarray(jnp.concatenate(f_chunks, axis=0))
+
+        results = []
+        for i in range(n_struct):
+            na = counts[i]
+            if self.is_ensemble:
+                e_i, f_i = E[i], F[i]  # (n_models,), (n_models, n_atoms, 3)
+                value = float(e_i.mean())
+                uncert = float(e_i.std())
+                results.append(
+                    {
+                        "energy": value,
+                        "forces": f_i.mean(axis=0)[:na],
+                        "energy_uncert": uncert,
+                        "energy_uncert_relative": (
+                            uncert / abs(value) if value else uncert
+                        ),
+                        "forces_uncert": float(
+                            onp.std(f_i, axis=0)[:na].sum()
+                        ),
+                    }
+                )
+            else:
+                results.append(
+                    {"energy": float(E[i]), "forces": F[i][:na]}
+                )
+        return results
